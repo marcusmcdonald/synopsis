@@ -1,0 +1,26 @@
+[project]
+name = "synopsis"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "binaryornot>=0.6.0",
+    "docling>=2.120.3",
+    "dspy>=3.3.0",
+    "ollama>=0.6.2",
+    "openai>=2.54.0",
+    "pydantic>=2.13.4",
+    "pyyaml>=6.0.3",
+    "sentence-transformers>=6.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.uv.workspace]
+members = [
+    "synopsis",
+]
