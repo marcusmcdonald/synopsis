@@ -30,7 +30,7 @@ class OpenAIExtractor[ModelT]:
         *,
         model: str,
         base_url: str | None = None,
-        api_key: str = "unused",
+        api_key: str | None = None,
         temperature: float = 0.2,
         output_model: type[ModelT] | None = None,
         **client_kwargs,
@@ -40,18 +40,18 @@ class OpenAIExtractor[ModelT]:
         Args:
             model: The model identifier to use for extraction.
             base_url: Base URL for the OpenAI-compatible API (optional).
-            api_key: API key for authentication (default "unused").
+            api_key: API key for authentication (optional, defaults to environment).
             temperature: Sampling temperature for generation (default 0.2).
             output_model: Optional Pydantic model defining the response shape.
             **client_kwargs: Additional keyword arguments passed to OpenAI client.
         """
-        # Import lazily so users of other adapters do not need openai installed.
+        import os
+
         from openai import OpenAI
 
-        kwargs = {
-            "api_key": api_key,
-            **client_kwargs,
-        }
+        effective_key = api_key or os.environ.get("OPENAI_API_KEY", "dummy")
+        kwargs = dict(client_kwargs)
+        kwargs["api_key"] = effective_key
         if base_url is not None:
             kwargs["base_url"] = base_url
 
@@ -75,18 +75,38 @@ class OpenAIExtractor[ModelT]:
         Returns:
             ExtractionResult containing the document summary.
         """
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": build_user_prompt(raw_text, char_budget, self._output_model),
+            },
+        ]
+
+        if self._output_model is not None:
+            try:
+                # Use native OpenAI structured outputs parsing
+                response = self._client.beta.chat.completions.parse(
+                    model=self._model,
+                    temperature=self._temperature,
+                    messages=messages,
+                    response_format=self._output_model,
+                )
+                if response.choices:
+                    structured = response.choices[0].message.parsed
+                    if structured is not None:
+                        return ExtractionResult(
+                            extracted_text=structured.model_dump_json(),
+                            structured_output=structured,
+                        )
+            except Exception:  # noqa: BLE001, S110
+                # Fallback to standard chat completions if beta parse is unsupported (e.g. local vLLM/LM Studio)
+                pass
+
         request = {
             "model": self._model,
             "temperature": self._temperature,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": build_user_prompt(
-                        raw_text, char_budget, self._output_model
-                    ),
-                },
-            ],
+            "messages": messages,
         }
         if self._output_model is not None:
             request["response_format"] = {
@@ -97,8 +117,8 @@ class OpenAIExtractor[ModelT]:
                     "schema": json_schema(self._output_model),
                 },
             }
-        response = self._client.chat.completions.create(**request)
 
-        text = response.choices[0].message.content or ""
+        response = self._client.chat.completions.create(**request)
+        text = response.choices[0].message.content or "" if response.choices else ""
         serialized, structured = parse_output(text, self._output_model)
         return ExtractionResult(serialized, structured)

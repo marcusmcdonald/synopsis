@@ -1,3 +1,4 @@
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -5,8 +6,8 @@ from typing import Any
 import numpy as np
 import yaml
 from binaryornot.check import is_binary
-from docling.datamodel.base_models import FormatToExtensions
-from docling.document_converter import ConversionStatus, DocumentConverter
+from docling.datamodel.base_models import ConversionStatus, FormatToExtensions
+from docling.document_converter import DocumentConverter
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 
@@ -21,6 +22,8 @@ from extractors import (
 # Type alias for document records in memory
 type DocumentSummaries = dict[str, dict[str, Any]]
 
+DEFAULT_MAX_FILE_CHARS = 120_000
+
 
 class DocumentSummary(BaseModel):
     title: str = Field(description="A concise, descriptive title.")
@@ -28,47 +31,45 @@ class DocumentSummary(BaseModel):
     details: str = Field(description="Key technical specifics.")
 
 
-def init_sqlite_db(db_path: Path) -> None:
-    """Initializes SQLite database and creates table with content_embedding column."""
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(db_path) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS document_corpus (
-                doc_id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                summary TEXT NOT NULL,
-                details TEXT NOT NULL,
-                content_embedding BLOB
-            );
-            """
-        )
-        conn.commit()
+def init_sqlite_db(conn: sqlite3.Connection) -> None:
+    """Initializes SQLite database schema and enables Write-Ahead Logging (WAL)."""
+    conn.execute("PRAGMA journal_mode = WAL;")
+    conn.execute("PRAGMA synchronous = NORMAL;")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS document_corpus (
+            doc_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            details TEXT NOT NULL,
+            content_embedding BLOB
+        );
+        """
+    )
+    conn.commit()
 
 
 def save_record_to_db(
-    db_path: Path,
+    conn: sqlite3.Connection,
     doc_id: str,
     title: str,
     summary: str,
     details: str,
     content_embedding: bytes | None = None,
 ) -> None:
-    """Inserts or updates a single document record including serialized embedding bytes."""
-    with sqlite3.connect(db_path) as conn:
-        conn.execute(
-            """
-            INSERT INTO document_corpus (doc_id, title, summary, details, content_embedding)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(doc_id) DO UPDATE SET
-                title = excluded.title,
-                summary = excluded.summary,
-                details = excluded.details,
-                content_embedding = excluded.content_embedding;
-            """,
-            (doc_id, title, summary, details, content_embedding),
-        )
-        conn.commit()
+    """Inserts or updates a single document record using an active database connection."""
+    conn.execute(
+        """
+        INSERT INTO document_corpus (doc_id, title, summary, details, content_embedding)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(doc_id) DO UPDATE SET
+            title = excluded.title,
+            summary = excluded.summary,
+            details = excluded.details,
+            content_embedding = excluded.content_embedding;
+        """,
+        (doc_id, title, summary, details, content_embedding),
+    )
 
 
 def get_all_docling_extensions(converter: DocumentConverter | None = None) -> set[str]:
@@ -85,6 +86,7 @@ def extract_content_from_file(
     file_path: Path,
     converter: DocumentConverter | None = None,
     docling_extensions: set[str] | None = None,
+    max_chars: int = DEFAULT_MAX_FILE_CHARS,
 ) -> tuple[str | None, str]:
     """Extracts text content from a file using Docling or direct text decoding."""
     exts = (
@@ -104,14 +106,23 @@ def extract_content_from_file(
             ):
                 text = res.document.export_to_markdown()
                 if text and text.strip():
-                    return text.strip(), "docling"
-                return None, "empty_docling_output"
+                    trimmed = text.strip()
+                    if len(trimmed) > max_chars:
+                        trimmed = (
+                            trimmed[:max_chars] + "\n\n[... content truncated ...]"
+                        )
+                    return trimmed, "docling"
         except (OSError, ValueError, RuntimeError) as e:
             if not is_binary(str(file_path)):
                 try:
                     fallback = file_path.read_text(encoding="utf-8", errors="replace")
                     if fallback.strip():
-                        return fallback, "text_fallback"
+                        trimmed = fallback.strip()
+                        if len(trimmed) > max_chars:
+                            trimmed = (
+                                trimmed[:max_chars] + "\n\n[... content truncated ...]"
+                            )
+                        return trimmed, "text_fallback"
                 except (OSError, UnicodeDecodeError):
                     return None, f"fallback_read_error: {e}"
             return None, f"docling_error: {e}"
@@ -127,7 +138,12 @@ def extract_content_from_file(
                 ):
                     text = res.document.export_to_markdown()
                     if text and text.strip():
-                        return text.strip(), "docling"
+                        trimmed = text.strip()
+                        if len(trimmed) > max_chars:
+                            trimmed = (
+                                trimmed[:max_chars] + "\n\n[... content truncated ...]"
+                            )
+                        return trimmed, "docling"
             except (OSError, ValueError, RuntimeError):
                 return None, "unsupported_binary"
             return None, "unsupported_binary"
@@ -138,7 +154,10 @@ def extract_content_from_file(
         content = file_path.read_text(encoding="utf-8", errors="replace")
         if not content.strip():
             return None, "empty_text_file"
-        return content, "code_or_text"
+        trimmed = content.strip()
+        if len(trimmed) > max_chars:
+            trimmed = trimmed[:max_chars] + "\n\n[... content truncated ...]"
+        return trimmed, "code_or_text"
     except (OSError, UnicodeDecodeError) as e:
         return None, f"read_error: {e}"
 
@@ -146,12 +165,15 @@ def extract_content_from_file(
 def create_extractor(
     model: str = "gpt-4o-mini",
     base_url: str | None = None,
-    api_key: str = "placeholder",
+    api_key: str | None = None,
     output_model: type[BaseModel] = DocumentSummary,
     backend: str = "auto",
 ) -> MetadataExtractor[Any]:
     """Instantiates an appropriate extractor adapter."""
     normalized_backend = backend.lower()
+    effective_api_key = (
+        api_key if api_key not in (None, "", "placeholder", "dummy", "unused") else None
+    )
 
     if normalized_backend == "dspy" or (
         normalized_backend == "auto" and model.startswith("dspy:")
@@ -160,9 +182,7 @@ def create_extractor(
         return DSPyExtractor(
             model=dspy_model,
             api_base=base_url,
-            api_key=api_key
-            if api_key not in ("placeholder", "dummy", "unused")
-            else None,
+            api_key=effective_api_key,
             output_model=output_model,
         )
 
@@ -178,7 +198,7 @@ def create_extractor(
         return OpenAIExtractor(
             model=model,
             base_url=base_url,
-            api_key=api_key if api_key != "placeholder" else "unused",
+            api_key=effective_api_key,
             output_model=output_model,
         )
 
@@ -196,7 +216,7 @@ def create_extractor(
     return OpenAIExtractor(
         model=model,
         base_url=base_url,
-        api_key=api_key if api_key != "placeholder" else "unused",
+        api_key=effective_api_key,
         output_model=output_model,
     )
 
@@ -208,12 +228,13 @@ def build_corpus(
     model: str = "gpt-4o-mini",
     embedding_model_name: str = "all-MiniLM-L6-v2",
     base_url: str | None = None,
-    api_key: str = "placeholder",
+    api_key: str | None = None,
     backend: str = "auto",
     extractor: MetadataExtractor[DocumentSummary] | None = None,
     converter: DocumentConverter | None = None,
     char_budget: int = 2_000,
     ignored_dirs: set[str] | list[str] | None = None,
+    max_file_chars: int = DEFAULT_MAX_FILE_CHARS,
 ) -> DocumentSummaries:
     """Traverses root_dir, generates summaries/embeddings, writes to SQLite DB."""
     if extractor is None:
@@ -231,9 +252,6 @@ def build_corpus(
     print(f"Loading embedding model: {embedding_model_name}")
     embedder = SentenceTransformer(embedding_model_name)
 
-    if db_path is not None:
-        init_sqlite_db(db_path)
-
     ignore_set = set(ignored_dirs) if ignored_dirs is not None else DEFAULT_IGNORED_DIRS
     docling_exts = get_all_docling_extensions(converter)
 
@@ -242,70 +260,90 @@ def build_corpus(
     resolved_db = db_path.resolve() if db_path is not None else None
     resolved_yaml = yaml_output.resolve() if yaml_output is not None else None
 
+    if db_path is not None:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db_conn = sqlite3.connect(db_path)
+        init_sqlite_db(db_conn)
+    else:
+        db_conn = None
+
     print(f"Scanning directory: {root_path}")
 
-    for file_path in sorted(root_path.rglob("*")):
-        if not file_path.is_file():
-            continue
+    # Top-down pruned directory walk to avoid traversing large ignored directory trees
+    files_to_process: list[Path] = []
+    for root, dirs, files in os.walk(root_path):
+        # Prune ignored directory trees in-place
+        dirs[:] = [d for d in dirs if d not in ignore_set]
+        for file_name in files:
+            file_path = Path(root) / file_name
+            resolved_file = file_path.resolve()
+            if (
+                resolved_file == resolved_db
+                or (resolved_yaml and resolved_file == resolved_yaml)
+                or file_name.endswith(("-journal", "-wal", "-shm"))
+            ):
+                continue
+            files_to_process.append(file_path)
 
-        resolved_file = file_path.resolve()
-        if (
-            resolved_file == resolved_db
-            or (resolved_yaml and resolved_file == resolved_yaml)
-            or file_path.name.endswith("-journal")
-            or file_path.name.endswith("-wal")
-        ):
-            continue
+    files_to_process.sort()
 
-        rel_path = file_path.relative_to(root_path)
+    try:
+        for file_path in files_to_process:
+            rel_path = file_path.relative_to(root_path)
+            doc_key = rel_path.as_posix()
 
-        if any(part in ignore_set for part in rel_path.parts[:-1]):
-            continue
-
-        doc_key = rel_path.as_posix()
-
-        content, method = extract_content_from_file(
-            file_path,
-            converter=converter,
-            docling_extensions=docling_exts,
-        )
-
-        if content is None:
-            continue
-
-        print(f"[+] Summarizing & Embedding ({method}): {rel_path} -> {doc_key}")
-        try:
-            summary = extractor(raw_text=content, char_budget=char_budget)
-
-            if summary.structured_output is not None:
-                record = summary.structured_output.model_dump()
-            else:
-                record = {
-                    "title": file_path.stem.replace("_", " ").title(),
-                    "summary": summary.extracted_text,
-                    "details": "Extracted via unstructured fallback.",
-                }
-
-            text_to_embed = (
-                f"{record['title']}: {record['summary']}\n{record['details']}"
+            content, method = extract_content_from_file(
+                file_path,
+                converter=converter,
+                docling_extensions=docling_exts,
+                max_chars=max_file_chars,
             )
-            embedding_vec = embedder.encode(text_to_embed, normalize_embeddings=True)
-            embedding_bytes = embedding_vec.astype(np.float32).tobytes()
 
-            corpus[doc_key] = record
+            if content is None:
+                continue
 
-            if db_path is not None:
-                save_record_to_db(
-                    db_path=db_path,
-                    doc_id=doc_key,
-                    title=record["title"],
-                    summary=record["summary"],
-                    details=record["details"],
-                    content_embedding=embedding_bytes,
+            print(f"[+] Summarizing & Embedding ({method}): {rel_path} -> {doc_key}")
+            try:
+                summary = extractor(raw_text=content, char_budget=char_budget)
+
+                if summary.structured_output is not None:
+                    record = summary.structured_output.model_dump()
+                else:
+                    record = {
+                        "title": file_path.stem.replace("_", " ").title(),
+                        "summary": summary.extracted_text,
+                        "details": "Extracted via unstructured fallback.",
+                    }
+
+                text_to_embed = (
+                    f"{record['title']}: {record['summary']}\n{record['details']}"
                 )
+                embedding_vec = embedder.encode(
+                    text_to_embed, normalize_embeddings=True
+                )
+                embedding_bytes = embedding_vec.astype(np.float32).tobytes()
 
-        except Exception as e:  # noqa: BLE001
-            print(f"[!] Error processing {rel_path}: {e}")
+                corpus[doc_key] = record
+
+                if db_conn is not None:
+                    save_record_to_db(
+                        conn=db_conn,
+                        doc_id=doc_key,
+                        title=record["title"],
+                        summary=record["summary"],
+                        details=record["details"],
+                        content_embedding=embedding_bytes,
+                    )
+
+            except Exception as e:  # noqa: BLE001
+                print(f"[!] Error processing {rel_path}: {e}")
+
+        if db_conn is not None:
+            db_conn.commit()
+
+    finally:
+        if db_conn is not None:
+            db_conn.close()
 
     if yaml_output is not None:
         yaml_output.parent.mkdir(parents=True, exist_ok=True)

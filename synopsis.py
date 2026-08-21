@@ -53,14 +53,20 @@ def synopsis():
     parser.add_argument(
         "--api-key",
         type=str,
-        default="dummy",
-        help="API Key",
+        default=None,
+        help="API Key (defaults to OPENAI_API_KEY environment variable)",
     )
     parser.add_argument(
         "--char-budget",
         type=int,
         default=2000,
-        help="Target character budget",
+        help="Target character budget for extracted summary",
+    )
+    parser.add_argument(
+        "--max-file-chars",
+        type=int,
+        default=120_000,
+        help="Maximum characters to read per file before truncating",
     )
     parser.add_argument(
         "--ignore-dir",
@@ -86,6 +92,7 @@ def synopsis():
         backend=args.backend,
         char_budget=args.char_budget,
         ignored_dirs=custom_ignored,
+        max_file_chars=args.max_file_chars,
     )
 
 

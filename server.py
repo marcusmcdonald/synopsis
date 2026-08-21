@@ -1,16 +1,19 @@
+import argparse
 import json
-from pathlib import Path
+import os
 import sqlite3
+from pathlib import Path
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
 import numpy as np
+from mcp.server.fastmcp import FastMCP
 from sentence_transformers import SentenceTransformer
 
 # Initialize FastMCP Server
 mcp = FastMCP("Corpus Intelligence Server")
-DB_PATH = Path("corpus.db")
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+
+DEFAULT_DB_PATH = Path(os.environ.get("SYNOPSIS_DB_PATH", "corpus.db"))
+DEFAULT_EMBEDDING_MODEL = os.environ.get("SYNOPSIS_EMBED_MODEL", "all-MiniLM-L6-v2")
 
 
 class CorpusIndex:
@@ -18,40 +21,58 @@ class CorpusIndex:
 
     def __init__(self, db_path: Path, model_name: str) -> None:
         self.db_path = db_path
+        self.model_name = model_name
         self.embedder = SentenceTransformer(model_name)
+        if hasattr(self.embedder, "get_embedding_dimension"):
+            self.dimension = int(self.embedder.get_embedding_dimension() or 384)
+        else:
+            self.dimension = int(
+                self.embedder.get_sentence_embedding_dimension() or 384
+            )
         self.doc_ids: list[str] = []
         self.titles: list[str] = []
         self.summaries: list[str] = []
-        self.embeddings: np.ndarray = np.empty((0, 384), dtype=np.float32)
+        self.embeddings: np.ndarray = np.empty((0, self.dimension), dtype=np.float32)
         self.load_index()
 
-    def load_index(self) -> None:
+    def load_index(self) -> int:
         """Loads records and embeddings into memory for fast similarity ranking."""
+        self.doc_ids = []
+        self.titles = []
+        self.summaries = []
+        self.embeddings = np.empty((0, self.dimension), dtype=np.float32)
+
         if not self.db_path.exists():
-            return
+            return 0
 
         doc_ids, titles, summaries, raw_vecs = [], [], [], []
 
-        with sqlite3.connect(self.db_path) as conn:
+        db_uri = f"file:{self.db_path.resolve()}?mode=ro"
+        with sqlite3.connect(db_uri, uri=True) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT doc_id, title, summary, content_embedding "
-                "FROM document_corpus"
+                "SELECT doc_id, title, summary, content_embedding FROM document_corpus"
             )
             for doc_id, title, summary, blob in cursor.fetchall():
                 doc_ids.append(doc_id)
                 titles.append(title)
                 summaries.append(summary)
                 if blob is not None:
-                    raw_vecs.append(np.frombuffer(blob, dtype=np.float32))
+                    vec = np.frombuffer(blob, dtype=np.float32)
+                    if vec.shape[0] == self.dimension:
+                        raw_vecs.append(vec)
+                    else:
+                        raw_vecs.append(np.zeros(self.dimension, dtype=np.float32))
                 else:
-                    raw_vecs.append(np.zeros(384, dtype=np.float32))
+                    raw_vecs.append(np.zeros(self.dimension, dtype=np.float32))
 
         self.doc_ids = doc_ids
         self.titles = titles
         self.summaries = summaries
         if raw_vecs:
             self.embeddings = np.vstack(raw_vecs)
+
+        return len(self.doc_ids)
 
     def rank(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
         """Computes cosine similarity ranking against the query embedding."""
@@ -75,20 +96,20 @@ class CorpusIndex:
 
 
 # Initialize index globally on server launch
-INDEX = CorpusIndex(DB_PATH, EMBEDDING_MODEL_NAME)
+INDEX = CorpusIndex(DEFAULT_DB_PATH, DEFAULT_EMBEDDING_MODEL)
 
 
 # MCP Resource: Database Schema Context
 @mcp.resource("schema://document_corpus")
 def get_schema() -> str:
     """Provides the exact SQL schema of the document corpus table."""
-    return """
+    return f"""
     CREATE TABLE document_corpus (
         doc_id TEXT PRIMARY KEY,       -- Relative file path / document key
         title TEXT NOT NULL,           -- Descriptive title
         summary TEXT NOT NULL,         -- 1-2 sentence high-level overview
         details TEXT NOT NULL,         -- Technical specifics & parameters
-        content_embedding BLOB         -- 384-dim float32 embedding vector
+        content_embedding BLOB         -- {INDEX.dimension}-dim float32 embedding vector
     );
     """
 
@@ -128,11 +149,19 @@ def query_document_corpus(query: str) -> str:
     if not sanitized.upper().startswith("SELECT"):
         return "Error: Only SELECT queries are permitted on this corpus."
 
+    if not INDEX.db_path.exists():
+        return f"Error: Database file does not exist at {INDEX.db_path}"
+
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        db_uri = f"file:{INDEX.db_path.resolve()}?mode=ro"
+        with sqlite3.connect(db_uri, uri=True) as conn:
+            conn.execute("PRAGMA query_only = ON;")
             cursor = conn.cursor()
             cursor.execute(sanitized)
             rows = cursor.fetchall()
+            if cursor.description is None:
+                return "[]"
+
             columns = [col[0] for col in cursor.description]
 
             formatted = []
@@ -151,5 +180,37 @@ def query_document_corpus(query: str) -> str:
         return f"SQL Execution Error: {e}"
 
 
-if __name__ == "__main__":
+# MCP Tool 3: Index Reload
+@mcp.tool()
+def reload_index() -> str:
+    """Reloads the in-memory document corpus and embeddings from the SQLite database."""
+    count = INDEX.load_index()
+    return f"Successfully reloaded index with {count} documents from {INDEX.db_path}."
+
+
+def main() -> None:
+    """CLI entry point for launching the MCP server."""
+    parser = argparse.ArgumentParser(description="Start the Synopsis MCP Server.")
+    parser.add_argument(
+        "--db",
+        type=Path,
+        default=DEFAULT_DB_PATH,
+        help="Path to SQLite database",
+    )
+    parser.add_argument(
+        "--embed-model",
+        type=str,
+        default=DEFAULT_EMBEDDING_MODEL,
+        help="SentenceTransformer model name",
+    )
+    args = parser.parse_args()
+
+    global INDEX
+    if args.db != DEFAULT_DB_PATH or args.embed_model != DEFAULT_EMBEDDING_MODEL:
+        INDEX = CorpusIndex(args.db, args.embed_model)
+
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

@@ -25,27 +25,35 @@ def parse_output[ModelT](
     text: str, output_model: type[ModelT] | None
 ) -> tuple[str, ModelT | None]:
     """Validate a model response and retain a canonical JSON representation."""
-
     if output_model is None:
         return text, None
 
     candidate = text.strip()
-    # Some compatible/local models still add a fence despite explicit prompting.
-    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", candidate, re.DOTALL)
-    if fenced:
-        candidate = fenced.group(1)
-    if hasattr(output_model, "model_validate_json"):
+
+    # 1. Check for markdown code blocks (e.g. ```json { ... } ```)
+    fenced_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", candidate, re.DOTALL)
+    if fenced_match:
+        candidate = fenced_match.group(1).strip()
+    else:
+        # 2. Check for outer json object bounds if there is leading/trailing text
+        outer_match = re.search(r"(\{.*\})", candidate, re.DOTALL)
+        if outer_match:
+            candidate = outer_match.group(1).strip()
+
+    try:
         value = output_model.model_validate_json(candidate)
         serialized = value.model_dump_json()
-    else:  # Pydantic v1
-        value = output_model.parse_raw(candidate)
-        serialized = value.json()
-    return serialized, value
+        return serialized, value
+    except Exception:  # noqa: BLE001
+        # Fallback: try standard json decode then model_validate
+        try:
+            raw_dict = json.loads(candidate)
+            value = output_model.model_validate(raw_dict)
+            return value.model_dump_json(), value
+        except Exception:  # noqa: BLE001
+            return candidate, None
 
 
 def json_schema(output_model: type[BaseModel]) -> dict[str, Any]:
-    """Return a Pydantic model's JSON Schema with a useful native format name."""
-
-    if hasattr(output_model, "model_json_schema"):
-        return output_model.model_json_schema()
-    return output_model.schema()  # Pydantic v1
+    """Return a Pydantic model's JSON Schema."""
+    return output_model.model_json_schema()

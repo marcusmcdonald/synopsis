@@ -4,7 +4,7 @@ This module provides a direct Ollama Python client implementation compatible
 with the extractor callable contract defined in base.py.
 """
 
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
@@ -57,7 +57,7 @@ class OllamaExtractor[ModelT]:
         Returns:
             ExtractionResult containing the document summary.
         """
-        request = {
+        request: dict[str, Any] = {
             "model": self._model,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -69,7 +69,6 @@ class OllamaExtractor[ModelT]:
                 },
             ],
             "options": {"temperature": self._temperature},
-            "format": "json",
         }
         if self._output_model is not None:
             request["format"] = json_schema(self._output_model)

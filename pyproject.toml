@@ -1,7 +1,7 @@
 [project]
 name = "synopsis"
 version = "0.1.0"
-description = "Add your description here"
+description = "Generate dense technical document and codebase corpus indexes with vector embeddings and FastMCP server"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -16,6 +16,10 @@ dependencies = [
     "sentence-transformers>=6.0.0",
 ]
 
+[project.scripts]
+synopsis = "synopsis:synopsis"
+synopsis-server = "server:main"
+
 [dependency-groups]
 dev = [
     "pre-commit>=4.6.2",
@@ -23,7 +27,7 @@ dev = [
     "ruff==0.16.3",
 ]
 
-[tool.uv.workspace]
-members = [
-    "synopsis",
-]
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
