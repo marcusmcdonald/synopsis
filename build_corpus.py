@@ -5,17 +5,18 @@ from typing import Any
 import numpy as np
 import yaml
 from binaryornot.check import is_binary
-from constants import DEFAULT_IGNORED_DIRS, DOCLING_DOCUMENT_EXTENSIONS
 from docling.datamodel.base_models import FormatToExtensions
 from docling.document_converter import ConversionStatus, DocumentConverter
+from pydantic import BaseModel, Field
+from sentence_transformers import SentenceTransformer
+
+from constants import DEFAULT_IGNORED_DIRS, DOCLING_DOCUMENT_EXTENSIONS
 from extractors import (
     DSPyExtractor,
     MetadataExtractor,
     OllamaExtractor,
     OpenAIExtractor,
 )
-from pydantic import BaseModel, Field
-from sentence_transformers import SentenceTransformer
 
 # Type alias for document records in memory
 type DocumentSummaries = dict[str, dict[str, Any]]
@@ -111,7 +112,7 @@ def extract_content_from_file(
                     fallback = file_path.read_text(encoding="utf-8", errors="replace")
                     if fallback.strip():
                         return fallback, "text_fallback"
-                except OSError, UnicodeDecodeError:
+                except (OSError, UnicodeDecodeError):
                     return None, f"fallback_read_error: {e}"
             return None, f"docling_error: {e}"
 
@@ -127,7 +128,7 @@ def extract_content_from_file(
                     text = res.document.export_to_markdown()
                     if text and text.strip():
                         return text.strip(), "docling"
-            except OSError, ValueError, RuntimeError:
+            except (OSError, ValueError, RuntimeError):
                 return None, "unsupported_binary"
             return None, "unsupported_binary"
     except (OSError, ValueError) as e:
