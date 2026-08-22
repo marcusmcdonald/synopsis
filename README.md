@@ -65,7 +65,7 @@ synopsis ./my-project --char-budget 1500 --ignore-dir extra_cache
 
 ## Running the MCP Server
 
-Start the FastMCP server for AI assistants (e.g. Claude Desktop, Antigravity):
+Start the FastMCP server for AI assistants (e.g. Claude Desktop, Antigravity, OpenCode):
 
 ```bash
 synopsis-server --db corpus.db
@@ -76,6 +76,49 @@ Or configure via environment variables:
 export SYNOPSIS_DB_PATH="corpus.db"
 export SYNOPSIS_EMBED_MODEL="all-MiniLM-L6-v2"
 synopsis-server
+```
+
+### OpenCode Configuration
+
+Add the server to your OpenCode configuration (e.g. `opencode.json`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "corpus-intelligence": {
+      "type": "local",
+      "command": [
+        "/path/to/your/venv/bin/python",
+        "/absolute/path/to/server.py"
+      ],
+      "enabled": true
+    }
+  }
+}
+```
+
+Alternatively, when running via `uv`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "corpus-intelligence": {
+      "type": "local",
+      "command": [
+        "uv",
+        "--directory",
+        "/absolute/path/to/synopsis",
+        "run",
+        "synopsis-server",
+        "--db",
+        "/absolute/path/to/corpus.db"
+      ],
+      "enabled": true
+    }
+  }
+}
 ```
 
 ## MCP Tools & Resources
