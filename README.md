@@ -90,3 +90,7 @@ synopsis-server
 ```bash
 uv run pytest
 ```
+
+## License
+
+MIT
