@@ -26,7 +26,7 @@ uv sync
 
 Or install in editable mode:
 ```bash
-pip install -e .
+uv pip install -e .
 ```
 
 ## CLI Usage
